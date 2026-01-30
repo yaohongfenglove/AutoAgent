@@ -1,27 +1,32 @@
 # -*- coding: utf-8 -*-
+import csv
 import json
 import os
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import Dict
 
 from dotenv import load_dotenv
 from langfuse.openai import OpenAI
 
+from config import PROJECT_ROOT
 from utils.constants import CLOTHING_ATTRIBUTES
 from utils.logger import logger
+
 
 # 加载环境变量
 load_dotenv(override=True)
 
 
-def analyze_clothing_image(image_url: str) -> Dict[str, bool]:
+def analyze_clothing_image(image_url: str) -> Dict[str, str]:
     """
     使用 OpenAI 分析衣服图片，判断多个特征
 
     Args:
         image_url: 图片url
 
-    Returns: 衣服特征字典
+    Returns: 包含图片URL和分析结果的字典
 
     """
 
@@ -85,9 +90,13 @@ def analyze_clothing_image(image_url: str) -> Dict[str, bool]:
         result = json.loads(result_text)
 
         # 动态构建返回结果
-        return {
+        analysis_result = {
             attr['key']: result.get(attr['key'], attr['default'])
             for attr in CLOTHING_ATTRIBUTES
+        }
+        return {
+            "image_url": image_url,
+            "analysis": analysis_result
         }
 
     except Exception as e:
@@ -96,13 +105,160 @@ def analyze_clothing_image(image_url: str) -> Dict[str, bool]:
         raise ValueError(error_log)
 
 
+def process_single_image(image_url: str, index: int) -> Dict:
+    """
+    处理单个图片
+
+    Args:
+        image_url: 图片URL
+        index: 索引编号
+
+    Returns: 处理结果字典
+    """
+    try:
+        logger.info(f"[{index}] 开始分析: {image_url}")
+        result = analyze_clothing_image(image_url)
+        logger.info(f"[{index}] 分析完成: {image_url}")
+        return {
+            "index": index,
+            **result
+        }
+    except Exception as e:
+        logger.error(f"[{index}] 分析失败 {image_url}: {str(e)}")
+        return {
+            "index": index,
+            "image_url": image_url,
+            "error": str(e),
+            "analysis": None
+        }
+
+
+def jsonl_to_csv(jsonl_file: str, csv_file: str) -> None:
+    """
+    将 JSONL 文件转换为 CSV 文件，展开 analysis 字段
+
+    Args:
+        jsonl_file: JSONL 文件路径
+        csv_file: 输出的 CSV 文件路径
+    """
+    results = []
+
+    # 读取 JSONL 文件
+    with open(jsonl_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                data = json.loads(line)
+
+                # 构建展开后的行数据
+                # image_view字段作用是直接在excel软件预览图片，操作方式见https://blog.wangjunfeng.com/post/excel-url-to-image/
+                index = data.get("index")
+                row = {
+                    "index": index,
+                    "image_url": data.get("image_url"),
+                    "image_view": f'="<table><img src="&B{index + 1}&" height=100 width=100></table>"',
+                }
+
+                # 如果有错误信息
+                if data.get("error"):
+                    row["error"] = data.get("error")
+
+                # 展开 analysis 字段
+                analysis = data.get("analysis", {})
+                if analysis:
+                    for attr in CLOTHING_ATTRIBUTES:
+                        key = attr['key']
+                        row[key] = analysis.get(key, attr['default'])
+
+                results.append(row)
+
+    # 获取所有列名
+    if not results:
+        logger.warning("没有数据需要写入 CSV")
+        return
+
+    # 构建 CSV 列名：基础字段 + 所有 analysis 字段
+    fieldnames = list(row.keys())
+
+    # 写入 CSV 文件
+    with open(csv_file, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+
+    logger.info(f"CSV 文件已保存: {csv_file}")
+
+
 def main():
-    image_url = "https://img.kwcdn.com/product/fmket/148f3c7d0775cd6f5bc4978a9583b02d.jpg"
+    # 读取 URLs
+    urls_file = PROJECT_ROOT / "urls.txt"
+    if not os.path.exists(urls_file):
+        logger.error(f"文件不存在: {urls_file}")
+        return
 
-    result = analyze_clothing_image(image_url)
-    logger.info(f"分析结果：{image_url}: {result}")
-    logger.info(f"大模型日志查看：{os.getenv('LANGFUSE_CLOUD_LOG')}")
+    with open(urls_file, "r", encoding="utf-8") as f:
+        image_urls = [line.strip() for line in f if line.strip()]
 
+    # image_urls = image_urls[0:500]
+
+    if not image_urls:
+        logger.warning("urls.txt 中没有找到任何 URL")
+        return
+
+    max_concurrent_requests = int(os.getenv("MAX_CONCURRENT_REQUESTS", "5"))
+    logger.info(f"共找到 {len(image_urls)} 个图片 URL，并发数{max_concurrent_requests}，开始并发处理...")
+
+    # 创建输出目录
+    output_dir = "output"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 并发处理
+    max_workers = max_concurrent_requests
+    results = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有任务
+        future_to_index = {
+            executor.submit(process_single_image, url, i + 1): (i + 1, url)
+            for i, url in enumerate(image_urls)
+        }
+
+        # 收集结果
+        for future in as_completed(future_to_index):
+            index, url = future_to_index[future]
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                logger.error(f"[{index}] 处理异常 {url}: {str(e)}")
+                results.append({
+                    "index": index,
+                    "image_url": url,
+                    "error": str(e),
+                    "analysis": None
+                })
+
+    # 保存结果为 JSONL
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    jsonl_file = os.path.join(output_dir, f"analysis_result_{timestamp}.jsonl")
+
+    with open(jsonl_file, "w", encoding="utf-8") as f:
+        for result in results:
+            f.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+    logger.info(f"JSONL 文件已保存: {jsonl_file}")
+
+    # 转换为 CSV
+    csv_file = os.path.join(output_dir, f"analysis_result_{timestamp}.csv")
+    jsonl_to_csv(jsonl_file, csv_file)
+
+    # 统计结果
+    success_count = sum(1 for r in results if r.get("analysis") is not None)
+    error_count = len(results) - success_count
+    logger.info(f"统计: 成功 {success_count}, 失败 {error_count}")
+
+    # 只在配置了 Langfuse 时输出日志链接
+    if os.getenv("LANGFUSE_SECRET_KEY") and os.getenv("LANGFUSE_CLOUD_LOG"):
+        logger.info(f"大模型日志查看：{os.getenv('LANGFUSE_CLOUD_LOG')}")
 
 if __name__ == "__main__":
     main()
