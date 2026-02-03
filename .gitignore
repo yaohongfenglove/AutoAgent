@@ -56,3 +56,6 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# URLs input file
+urls.txt
