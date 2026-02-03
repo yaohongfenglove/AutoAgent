@@ -5,3 +5,6 @@ black==26.1.0
 isort==7.0.0
 requests==2.32.5
 loguru==0.7.3
+opencv-python==4.9.0.80
+numpy==1.26.3
+Pillow==10.2.0

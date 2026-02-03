@@ -11,7 +11,8 @@ from dotenv import load_dotenv
 from langfuse.openai import OpenAI
 
 from config import PROJECT_ROOT
-from utils.constants import CLOTHING_ATTRIBUTES
+from utils.color_detector import ColorDetector
+from utils.constants import CLOTHING_ATTRIBUTES, FILTER_COLOR
 from utils.logger import logger
 
 
@@ -22,6 +23,7 @@ load_dotenv(override=True)
 def analyze_clothing_image(image_url: str) -> Dict[str, str]:
     """
     使用 OpenAI 分析衣服图片，判断多个特征
+    颜色检测根据配置选择方法（OpenCV 或大模型），其他属性使用 GPT-4o
 
     Args:
         image_url: 图片url
@@ -29,21 +31,55 @@ def analyze_clothing_image(image_url: str) -> Dict[str, str]:
     Returns: 包含图片URL和分析结果的字典
 
     """
+    # 读取颜色检测方式
+    color_detection_method = os.getenv("COLOR_DETECTION_METHOD", "opencv").strip().lower()
 
-    # 构建分析提示词（动态渲染）
+    # Step 1: 颜色检测
+    color_results = {}
+    if FILTER_COLOR:
+        if color_detection_method == "opencv":
+            # 使用传统图像处理
+            detector = ColorDetector()
+            is_match = detector.detect_color(image_url, FILTER_COLOR)
+            color_results[f"is_{FILTER_COLOR}"] = is_match
+        else:
+            # 使用大模型判断，放到 Step 2 中处理
+            pass
+
+    # Step 2: 其他属性（GPT-4o 大模型）
+    # 根据检测方式决定哪些属性用大模型判断
+    if FILTER_COLOR and color_detection_method == "opencv":
+        # 如果配置了颜色筛选且使用 OpenCV，排除该颜色属性
+        non_color_attrs = [
+            attr for attr in CLOTHING_ATTRIBUTES
+            if attr['key'] != f"is_{FILTER_COLOR}"
+        ]
+    else:
+        # 其他情况：使用大模型判断所有属性（包括颜色）
+        non_color_attrs = CLOTHING_ATTRIBUTES
+
+    # 如果没有非颜色属性需要判断，直接返回颜色结果
+    if not non_color_attrs:
+        return {
+            "image_url": image_url,
+            "analysis": color_results
+        }
+
+    # 构建分析提示词（只包含非颜色属性）
     questions_text = "\n".join([
         f"{i+1}. {attr['key']}: {attr['description']}"
-        for i, attr in enumerate(CLOTHING_ATTRIBUTES)
+        for i, attr in enumerate(non_color_attrs)
     ])
 
     example_json = {
         attr['key']: attr['default'] if attr['key'] != 'is_long_sleeve' else True
-        for attr in CLOTHING_ATTRIBUTES
+        for attr in non_color_attrs
     }
     # 修改示例值使其更有意义
-    example_json["is_dark_black"] = True
-    example_json["is_long_sleeve"] = True
-    example_json["has_both_sides_pattern"] = True
+    if "is_long_sleeve" in example_json:
+        example_json["is_long_sleeve"] = True
+    if "has_both_sides_pattern" in example_json:
+        example_json["has_both_sides_pattern"] = True
 
     prompt = f"""请分析这张衣服图片，并回答以下问题。请以JSON格式返回结果，包含以下字段：
 
@@ -89,10 +125,16 @@ def analyze_clothing_image(image_url: str) -> Dict[str, str]:
 
         result = json.loads(result_text)
 
-        # 动态构建返回结果
-        analysis_result = {
+        # 动态构建返回结果（只包含非颜色属性）
+        ai_result = {
             attr['key']: result.get(attr['key'], attr['default'])
-            for attr in CLOTHING_ATTRIBUTES
+            for attr in non_color_attrs
+        }
+
+        # Step 3: 合并颜色检测结果和 AI 分析结果
+        analysis_result = {
+            **color_results,
+            **ai_result
         }
         return {
             "image_url": image_url,
